@@ -1,0 +1,46 @@
+parameters:
+	ignoreErrors:
+		-
+			message: "#^Cannot cast mixed to string\\.$#"
+			count: 2
+			path: src/Filter.php
+
+		-
+			message: "#^Dead catch \\- Exception is never thrown in the try block\\.$#"
+			count: 1
+			path: src/Filter.php
+
+		-
+			message: "#^Class ipl\\\\Stdlib\\\\Filter\\\\Chain implements generic interface IteratorAggregate but does not specify its types\\: TKey, TValue$#"
+			count: 1
+			path: src/Filter/Chain.php
+
+		-
+			message: "#^Cannot access offset 'data' on mixed\\.$#"
+			count: 1
+			path: src/PriorityQueue.php
+
+		-
+			message: "#^Cannot access offset 'priority' on mixed\\.$#"
+			count: 1
+			path: src/PriorityQueue.php
+
+		-
+			message: "#^Cannot access offset 0 on mixed\\.$#"
+			count: 1
+			path: src/PriorityQueue.php
+
+		-
+			message: "#^Class ipl\\\\Stdlib\\\\PriorityQueue extends generic class SplPriorityQueue but does not specify its types\\: TPriority, TValue$#"
+			count: 1
+			path: src/PriorityQueue.php
+
+		-
+			message: "#^Trying to invoke mixed but it's not a callable\\.$#"
+			count: 2
+			path: src/Seq.php
+
+		-
+			message: "#^Parameter \\#1 \\$separator of function explode expects non\\-empty\\-string, string given\\.$#"
+			count: 3
+			path: src/Str.php

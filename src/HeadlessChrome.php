@@ -2,23 +2,28 @@
 
 /* Icinga PDF Export | (c) 2018 Icinga GmbH | GPLv2 */
 
-namespace Icinga\Module\Pdfexport;
+namespace ipl\Pdf;
+
+require_once "DeferredMessage.php";
 
 use Exception;
-use Icinga\Application\Logger;
-use Icinga\Application\Platform;
-use Icinga\File\Storage\StorageInterface;
-use Icinga\File\Storage\TemporaryLocalFileStorage;
-use ipl\Html\HtmlString;
+use GuzzleHttp\Exception\GuzzleException;
 use LogicException;
+use Psr\Log\LoggerAwareInterface;
+use Psr\Log\LoggerAwareTrait;
+use Psr\Log\LoggerInterface;
 use React\ChildProcess\Process;
-use React\EventLoop\Factory;
+use React\EventLoop\Loop;
 use React\EventLoop\TimerInterface;
+use RuntimeException;
+use WebSocket\BadOpcodeException;
 use WebSocket\Client;
 use WebSocket\ConnectionException;
 
-class HeadlessChrome
+class HeadlessChrome implements LoggerAwareInterface
 {
+    use LoggerAwareTrait;
+
     /**
      * Line of stderr output identifying the websocket url
      *
@@ -49,37 +54,36 @@ new Promise((fulfill, reject) => {
 })
 JS;
 
-    /** @var string Path to the Chrome binary */
+    /** @var ?string Path to the Chrome binary */
     protected $binary;
 
-    /** @var array Host and port to the remote Chrome */
-    protected $remote;
+    /** @var ?array Host and port to the remote Chrome */
+    protected ?array $remote;
 
-    /**
-     * The document to print
-     *
-     * @var PrintableHtmlDocument
-     */
-    protected $document;
+    /** @var string The document to print */
+    protected string $document;
 
-    /** @var string Target Url */
+    /** @var ?string Target Url */
     protected $url;
 
-    /** @var StorageInterface */
-    protected $fileStorage;
+    /** @var TemporaryDirectory */
+    protected TemporaryDirectory $temporaryDirectory;
+
+    /** @var LoggerInterface */
+    protected $logger;
 
     /** @var array */
-    private $interceptedRequests = [];
+    protected array $interceptedRequests = [];
 
     /** @var array */
-    private $interceptedEvents = [];
+    protected array $interceptedEvents = [];
 
     /**
      * Get the path to the Chrome binary
      *
      * @return  string
      */
-    public function getBinary()
+    public function getBinary(): string
     {
         return $this->binary;
     }
@@ -87,11 +91,11 @@ JS;
     /**
      * Set the path to the Chrome binary
      *
-     * @param   string  $binary
+     * @param string $binary
      *
      * @return  $this
      */
-    public function setBinary($binary)
+    public function setBinary(string $binary): self
     {
         $this->binary = $binary;
 
@@ -103,7 +107,7 @@ JS;
      *
      * @return array
      */
-    public function getRemote()
+    public function getRemote(): array
     {
         return $this->remote;
     }
@@ -112,11 +116,11 @@ JS;
      * Set host and port combination of a remote chrome
      *
      * @param string $host
-     * @param int    $port
+     * @param int $port
      *
      * @return $this
      */
-    public function setRemote($host, $port)
+    public function setRemote(string $host, int $port): self
     {
         $this->remote = [$host, $port];
 
@@ -126,9 +130,9 @@ JS;
     /**
      * Get the target Url
      *
-     * @return  string
+     * @return ?string
      */
-    public function getUrl()
+    public function getUrl(): ?string
     {
         return $this->url;
     }
@@ -136,41 +140,37 @@ JS;
     /**
      * Set the target Url
      *
-     * @param   string  $url
+     * @param string $url
      *
-     * @return  $this
+     * @return $this
      */
-    public function setUrl($url)
+    public function setUrl(string $url): self
     {
         $this->url = $url;
 
         return $this;
     }
 
-    /**
-     * Get the file storage
-     *
-     * @return  StorageInterface
-     */
-    public function getFileStorage()
+    public function getTemporaryDirectory(): TemporaryDirectory
     {
-        if ($this->fileStorage === null) {
-            $this->fileStorage = new TemporaryLocalFileStorage();
-        }
-
-        return $this->fileStorage;
+        return $this->temporaryDirectory;
     }
 
-    /**
-     * Set the file storage
-     *
-     * @param   StorageInterface  $fileStorage
-     *
-     * @return  $this
-     */
-    public function setFileStorage($fileStorage)
+    public function setTemporaryDirectory(TemporaryDirectory $temporaryDirectory): self
     {
-        $this->fileStorage = $fileStorage;
+        $this->temporaryDirectory = $temporaryDirectory;
+
+        return $this;
+    }
+
+    public function getLogger(): LoggerInterface
+    {
+        return $this->logger;
+    }
+
+    public function setLogger(LoggerInterface $logger): self
+    {
+        $this->logger = $logger;
 
         return $this;
     }
@@ -178,11 +178,11 @@ JS;
     /**
      * Render the given argument name-value pairs as shell-escaped string
      *
-     * @param   array   $arguments
+     * @param array $arguments
      *
      * @return  string
      */
-    public static function renderArgumentList(array $arguments)
+    public static function renderArgumentList(array $arguments): string
     {
         $list = [];
 
@@ -190,7 +190,7 @@ JS;
             if ($value !== null) {
                 $value = escapeshellarg($value);
 
-                if (! is_int($name)) {
+                if (!is_int($name)) {
                     if (substr($name, -1) === '=') {
                         $glue = '';
                     } else {
@@ -210,42 +210,14 @@ JS;
     }
 
     /**
-     * Use the given HTML as input
-     *
-     * @param string|PrintableHtmlDocument $html
-     * @param bool $asFile
-     * @return $this
-     */
-    public function fromHtml($html, $asFile = false)
-    {
-        if ($html instanceof PrintableHtmlDocument) {
-            $this->document = $html;
-        } else {
-            $this->document = (new PrintableHtmlDocument())
-                ->setContent(HtmlString::create($html));
-        }
-
-        if ($asFile) {
-            $path = uniqid('icingaweb2-pdfexport-') . '.html';
-            $storage = $this->getFileStorage();
-
-            $storage->create($path, $this->document->render());
-
-            $path = $storage->resolvePath($path, true);
-
-            $this->setUrl("file://$path");
-        }
-
-        return $this;
-    }
-
-    /**
      * Export to PDF
      *
+     * @param string $html
      * @return string
+     * @throws GuzzleException
      * @throws Exception
      */
-    public function toPdf()
+    public function toPdf(string $html, array $parameters): string
     {
         switch (true) {
             case $this->remote !== null:
@@ -253,27 +225,30 @@ JS;
                     $result = $this->jsonVersion($this->remote[0], $this->remote[1]);
                     $parts = explode('/', $result['webSocketDebuggerUrl']);
                     $pdf = $this->printToPDF(
+                        $html,
                         join(':', $this->remote),
                         end($parts),
-                        ! $this->document->isEmpty() ? $this->document->getPrintParameters() : []
+                        $parameters
                     );
                     break;
                 } catch (Exception $e) {
                     if ($this->binary === null) {
                         throw $e;
                     } else {
-                        Logger::warning(
+                        $this->logger->warning(
                             'Failed to connect to remote chrome: %s:%d (%s)',
-                            $this->remote[0],
-                            $this->remote[1],
-                            $e
+                            [
+                                $this->remote[0],
+                                $this->remote[1],
+                                $e
+                            ]
                         );
                     }
                 }
 
-                // Fallback to the local binary if a remote chrome is unavailable
+            // Fallback to the local binary if a remote chrome is unavailable
             case $this->binary !== null:
-                $browserHome = $this->getFileStorage()->resolvePath('HOME');
+                $browserHome = $this->getTemporaryDirectory()->resolvePath('HOME');
                 $commandLine = join(' ', [
                     escapeshellarg($this->getBinary()),
                     static::renderArgumentList([
@@ -289,41 +264,52 @@ JS;
                     ])
                 ]);
 
-                if (Platform::isLinux()) {
-                    Logger::debug('Starting browser process: HOME=%s exec %s', $browserHome, $commandLine);
-                    $chrome = new Process('exec ' . $commandLine, null, ['HOME' => $browserHome]);
-                } else {
-                    Logger::debug('Starting browser process: %s', $commandLine);
-                    $chrome = new Process($commandLine);
+                switch (PHP_OS_FAMILY) {
+                    case 'BSD':
+                    case 'Darwin':
+                    case 'Solaris':
+                    case 'Linux':
+                        $this->logger->debug('Starting browser process: HOME=%s exec %s', [$browserHome, $commandLine]);
+                        $chrome = new Process('exec ' . $commandLine, null, ['HOME' => $browserHome]);
+                        break;
+                    case 'Windows':
+                        $this->logger->debug('Starting browser process: %s', [$commandLine]);
+                        $chrome = new Process($commandLine);
+                        break;
+                    default:
+                        throw new RuntimeException(
+                            'Unknown OS detected while starting browser process: ' . PHP_OS . '\''
+                        );
                 }
 
-                $loop = Factory::create();
+                $loop = Loop::get();
 
                 $killer = $loop->addTimer(10, function (TimerInterface $timer) use ($chrome) {
                     $chrome->terminate(6); // SIGABRT
-                    Logger::error(
+                    $this->logger->error(
                         'Terminated browser process after %d seconds elapsed without the expected output',
-                        $timer->getInterval()
+                        [$timer->getInterval()]
                     );
                 });
 
                 $chrome->start($loop);
 
                 $pdf = null;
-                $chrome->stderr->on('data', function ($chunk) use (&$pdf, $chrome, $loop, $killer) {
-                    Logger::debug('Caught browser output: %s', $chunk);
+                $chrome->stderr->on('data', function ($chunk) use ($html, $parameters, &$pdf, $chrome, $loop, $killer) {
+                    $this->logger->debug('Caught browser output: %s', [$chunk]);
 
                     if (preg_match(self::DEBUG_ADDR_PATTERN, trim($chunk), $matches)) {
                         $loop->cancelTimer($killer);
 
                         try {
                             $pdf = $this->printToPDF(
+                                $html,
                                 $matches[1],
                                 $matches[2],
-                                ! $this->document->isEmpty() ? $this->document->getPrintParameters() : []
+                                $parameters
                             );
                         } catch (Exception $e) {
-                            Logger::error('Failed to print PDF. An error occurred: %s', $e);
+                            $this->logger->error('Failed to print PDF. An error occurred: %s', [$e]);
                         }
 
                         $chrome->terminate();
@@ -333,7 +319,7 @@ JS;
                 $chrome->on('exit', function ($exitCode, $termSignal) use ($loop, $killer) {
                     $loop->cancelTimer($killer);
 
-                    Logger::debug('Browser terminated by signal %d and exited with code %d', $termSignal, $exitCode);
+                    $this->logger->debug('Browser terminated by signal %d and exited with code %d', [$termSignal, $exitCode]);
                 });
 
                 $loop->run();
@@ -350,30 +336,15 @@ JS;
     }
 
     /**
-     * Export to PDF and save as file on disk
-     *
-     * @return string The path to the file on disk
+     * @throws Exception
      */
-    public function savePdf()
-    {
-        $path = uniqid('icingaweb2-pdfexport-') . '.pdf';
-
-        $storage = $this->getFileStorage();
-        $storage->create($path, '');
-
-        $path = $storage->resolvePath($path, true);
-        file_put_contents($path, $this->toPdf());
-
-        return $path;
-    }
-
-    private function printToPDF($socket, $browserId, array $parameters)
+    private function printToPDF(string $html, string $socket, string $browserId, array $parameters)
     {
         $browser = new Client(sprintf('ws://%s/devtools/browser/%s', $socket, $browserId));
 
         // Open new tab, get its id
         $result = $this->communicate($browser, 'Target.createTarget', [
-            'url'   => 'about:blank'
+            'url' => 'about:blank'
         ]);
         if (isset($result['targetId'])) {
             $targetId = $result['targetId'];
@@ -397,7 +368,7 @@ JS;
         if (($url = $this->getUrl()) !== null) {
             // Navigate to target
             $result = $this->communicate($page, 'Page.navigate', [
-                'url'   => $url
+                'url' => $url
             ]);
             if (isset($result['frameId'])) {
                 $frameId = $result['frameId'];
@@ -407,11 +378,11 @@ JS;
 
             // wait for page to fully load
             $this->waitFor($page, 'Page.frameStoppedLoading', ['frameId' => $frameId]);
-        } elseif (! $this->document->isEmpty()) {
+        } elseif ($html !== '') {
             // If there's no url to load transfer the document's content directly
             $this->communicate($page, 'Page.setDocumentContent', [
-                'frameId'   => $targetId,
-                'html'      => $this->document->render()
+                'frameId' => $targetId,
+                'html' => $html
             ]);
 
             // wait for page to fully load
@@ -424,29 +395,29 @@ JS;
         $this->waitFor($page, self::WAIT_FOR_NETWORK);
 
         // Wait for layout to initialize
-        if (! $this->document->isEmpty()) {
+        if ($html !== '') {
             // Ensure layout scripts work in the same environment as the pdf printing itself
             $this->communicate($page, 'Emulation.setEmulatedMedia', ['media' => 'print']);
 
             $this->communicate($page, 'Runtime.evaluate', [
-                'timeout'       => 1000,
-                'expression'    => 'setTimeout(() => new Layout().apply(), 0)'
+                'timeout' => 1000,
+                'expression' => 'setTimeout(() => new Layout().apply(), 0)'
             ]);
 
             $promisedResult = $this->communicate($page, 'Runtime.evaluate', [
-                'awaitPromise'  => true,
+                'awaitPromise' => true,
                 'returnByValue' => true,
-                'timeout'       => 1000, // Failsafe, doesn't apply to `await` it seems
-                'expression'    => static::WAIT_FOR_LAYOUT
+                'timeout' => 1000, // Failsafe, doesn't apply to `await` it seems
+                'expression' => static::WAIT_FOR_LAYOUT
             ]);
             if (isset($promisedResult['exceptionDetails'])) {
                 if (isset($promisedResult['exceptionDetails']['exception']['description'])) {
-                    Logger::error(
+                    $this->logger->error(
                         'PDF layout failed to initialize: %s',
-                        $promisedResult['exceptionDetails']['exception']['description']
+                        [$promisedResult['exceptionDetails']['exception']['description']]
                     );
                 } else {
-                    Logger::warning('PDF layout failed to initialize. Pages might look skewed.');
+                    $this->logger->warning('PDF layout failed to initialize. Pages might look skewed.');
                 }
             }
 
@@ -455,11 +426,20 @@ JS;
         }
 
         // print pdf
-        $result = $this->communicate($page, 'Page.printToPDF', array_merge(
-            $parameters,
-            ['transferMode' => 'ReturnAsBase64', 'printBackground' => true]
-        ));
-        if (isset($result['data']) && !empty($result['data'])) {
+//        try {
+            $result = $this->communicate($page, 'Page.printToPDF', array_merge(
+                $parameters,
+                ['transferMode' => 'ReturnAsBase64', 'printBackground' => true]
+            ));
+//            echo "No Exception";exit;
+//
+//        } catch (\Exception $e) {
+//            echo "<pre>"; print_r($e); exit;
+////            echo "Exception";exit;
+//        }
+
+
+        if (!empty($result['data'])) {
             $pdf = base64_decode($result['data']);
         } else {
             throw new Exception('Expected base64 data. Got instead: ' . json_encode($result));
@@ -469,7 +449,7 @@ JS;
         $result = $this->communicate($browser, 'Target.closeTarget', [
             'targetId' => $targetId
         ]);
-        if (! isset($result['success'])) {
+        if (!isset($result['success'])) {
             throw new Exception('Expected close confirmation. Got instead: ' . json_encode($result));
         }
 
@@ -477,13 +457,13 @@ JS;
             $browser->close();
         } catch (ConnectionException $e) {
             // For some reason, the browser doesn't send a response
-            Logger::debug(sprintf('Failed to close browser connection: ' . $e->getMessage()));
+            $this->logger->debug('Failed to close browser connection: %s', [$e->getMessage()]);
         }
 
         return $pdf;
     }
 
-    private function renderApiCall($method, $options = null)
+    private function renderApiCall(string $method, array $options = null): string
     {
         $data = [
             'id' => time(),
@@ -494,7 +474,10 @@ JS;
         return json_encode($data, JSON_FORCE_OBJECT);
     }
 
-    private function parseApiResponse($payload)
+    /**
+     * @throws Exception
+     */
+    private function parseApiResponse(string $payload)
     {
         $data = json_decode($payload, true);
         if (isset($data['method']) || isset($data['result'])) {
@@ -510,33 +493,9 @@ JS;
         }
     }
 
-    private function registerEvent($method, $params)
+    private function registerEvent(string $method, array $params): void
     {
-        if (Logger::getInstance()->getLevel() === Logger::DEBUG) {
-            $shortenValues = function ($params) use (&$shortenValues) {
-                foreach ($params as &$value) {
-                    if (is_array($value)) {
-                        $value = $shortenValues($value);
-                    } elseif (is_string($value)) {
-                        $shortened = substr($value, 0, 256);
-                        if ($shortened !== $value) {
-                            $value = $shortened . '...';
-                        }
-                    }
-                }
-
-                return $params;
-            };
-            $shortenedParams = $shortenValues($params);
-
-            Logger::debug(
-                'Received CDP event: %s(%s)',
-                $method,
-                join(',', array_map(function ($param) use ($shortenedParams) {
-                    return $param . '=' . json_encode($shortenedParams[$param]);
-                }, array_keys($shortenedParams)))
-            );
-        }
+        $this->logger->debug(new DeferredMessage($method, $params));
 
         if ($method === 'Network.requestWillBeSent') {
             $this->interceptedRequests[$params['requestId']] = $params;
@@ -546,20 +505,25 @@ JS;
             $requestData = $this->interceptedRequests[$params['requestId']];
             unset($this->interceptedRequests[$params['requestId']]);
 
-            Logger::error(
+            $this->logger->error(
                 'Headless Chrome was unable to complete a request to "%s". Error: %s',
-                $requestData['request']['url'],
-                $params['errorText']
+                [
+                    $requestData['request']['url'],
+                    $params['errorText']
+                ]
             );
         } else {
             $this->interceptedEvents[] = ['method' => $method, 'params' => $params];
         }
     }
 
-    private function communicate(Client $ws, $method, $params = null)
+    /**
+     * @throws BadOpcodeException
+     */
+    private function communicate(Client $ws, string $method, array $parameters = null)
     {
-        Logger::debug('Transmitting CDP call: %s(%s)', $method, $params ? join(',', array_keys($params)) : '');
-        $ws->send($this->renderApiCall($method, $params));
+        $this->logger->debug('Transmitting CDP call: %s(%s)', [$method, $parameters ? join(',', array_keys($parameters)) : '']);
+        $ws->send($this->renderApiCall($method, $parameters));
 
         do {
             $response = $this->parseApiResponse($ws->receive());
@@ -570,20 +534,26 @@ JS;
             }
         } while ($gotEvent);
 
-        Logger::debug('Received CDP result: %s', empty($response['result'])
-            ? 'none'
-            : join(',', array_keys($response['result'])));
+        $this->logger->debug('Received CDP result: %s',
+            [
+                empty($response['result'])
+                    ? 'none'
+                    : join(',', array_keys($response['result']))
+            ]
+        );
 
         return $response['result'];
     }
 
-    private function waitFor(Client $ws, $eventName, array $expectedParams = null)
+    private function waitFor(Client $ws, string $eventName, array $expectedParams = null): ?array
     {
         if ($eventName !== self::WAIT_FOR_NETWORK) {
-            Logger::debug(
+            $this->logger->debug(
                 'Awaiting CDP event: %s(%s)',
-                $eventName,
-                $expectedParams ? join(',', array_keys($expectedParams)) : ''
+                [
+                    $eventName,
+                    $expectedParams ? join(',', array_keys($expectedParams)) : ''
+                ]
             );
         } elseif (empty($this->interceptedRequests)) {
             return null;
@@ -606,12 +576,12 @@ JS;
                 $method = $response['method'];
                 $params = $response['params'];
 
-                if (! $intercepted) {
+                if (!$intercepted) {
                     $this->registerEvent($method, $params);
                 }
 
                 if ($eventName === self::WAIT_FOR_NETWORK) {
-                    $wait = ! empty($this->interceptedRequests);
+                    $wait = !empty($this->interceptedRequests);
                 } elseif ($method === $eventName) {
                     if ($expectedParams !== null) {
                         $diff = array_intersect_assoc($params, $expectedParams);
@@ -621,7 +591,7 @@ JS;
                     }
                 }
 
-                if (! $wait && $intercepted) {
+                if (!$wait && $intercepted) {
                     unset($this->interceptedEvents[$interceptedPos]);
                 }
             }
@@ -635,7 +605,7 @@ JS;
      *
      * @return  int|false
      *
-     * @throws  Exception
+     * @throws  Exception|GuzzleException
      */
     public function getVersion()
     {
@@ -649,19 +619,21 @@ JS;
                     if ($this->binary === null) {
                         throw $e;
                     } else {
-                        Logger::warning(
+                        $this->logger->warning(
                             'Failed to connect to remote chrome: %s:%d (%s)',
-                            $this->remote[0],
-                            $this->remote[1],
-                            $e
+                            [
+                                $this->remote[0],
+                                $this->remote[1],
+                                $e
+                            ]
                         );
                     }
                 }
 
-                // Fallback to the local binary if a remote chrome is unavailable
+            // Fallback to the local binary if a remote chrome is unavailable
             case $this->binary !== null:
                 $command = new ShellCommand(
-                    escapeshellarg($this->getBinary()) . ' ' . static::renderArgumentList(['--version']),
+                    escapeshellarg($this->getBinary()) . ' HeadlessChrome.php' . static::renderArgumentList(['--version']),
                     false
                 );
 
@@ -678,7 +650,7 @@ JS;
         }
 
         if (preg_match('/(\d+)\.[\d.]+/', $version, $match)) {
-            return (int) $match[1];
+            return (int)$match[1];
         }
 
         return false;
@@ -688,11 +660,12 @@ JS;
      * Fetch result from the /json/version API endpoint
      *
      * @param string $host
-     * @param int    $port
+     * @param int $port
      *
      * @return bool|array
+     * @throws GuzzleException
      */
-    protected function jsonVersion($host, $port)
+    protected function jsonVersion(string $host, int $port)
     {
         $client = new \GuzzleHttp\Client();
         $response = $client->request('GET', sprintf('http://%s:%s/json/version', $host, $port));

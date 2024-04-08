@@ -1,0 +1,28 @@
+{
+  "name": "ipl/pdf",
+  "type": "library",
+  "description": "Icinga PHP Library - PDF generation over headless chrome",
+  "license": "MIT",
+  "keywords": ["pdf"],
+  "homepage": "https://github.com/Icinga/ipl-pdf",
+  "config": {
+    "sort-packages": true,
+    "platform": {
+      "php": "7.4"
+    }
+  },
+  "require": {
+    "react/child-process": "^v0.6.5",
+    "react/event-loop": "^v1.4.0",
+    "textalk/websocket": "^1.5",
+    "iio/libmergepdf": "^4.0",
+    "ipl/html": "^v0.8.0",
+    "guzzlehttp/guzzle": "^v7.7.0",
+    "ext-json": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "ipl\\Pdf\\": "src"
+    }
+  }
+}
